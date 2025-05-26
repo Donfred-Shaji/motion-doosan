@@ -3,11 +3,12 @@ import threading
 import time
 import sys
 import os
+import yaml
 
 from rclpy.logging import get_logger
-from dsr_msgs2.srv import DrlPause
+from dsr_msgs2.srv import DrlPause, GetCurrentPosx
 
-# for single robot
+# Robot configuration
 ROBOT_ID = "dsr01"
 ROBOT_MODEL = "m1013"
 
@@ -15,27 +16,30 @@ import DR_init
 DR_init.__dsr__id = ROBOT_ID
 DR_init.__dsr__model = ROBOT_MODEL
 
-# Thread-safe flag for pausing
+# Thread-safe control flags
 pause_flag = threading.Event()
-pause_flag.set()  # Start as unpaused
+pause_flag.set()  # Start unpaused
 
-# For stopping the thread
 stop_flag = threading.Event()
 
 logger = get_logger('dsr_motion')
 
-# Global variable for service client, initialized on demand
-pause_service_client = None # client to be created only once  and reused for subsequent calls
+# Global service clients
+pause_service_client = None
+pose_service_client = None
+
+# File to store saved poses
+POSE_SAVE_PATH = "recorded_poses.yaml"
+
 
 def send_pause_service_request(node):
     global pause_service_client
 
     if pause_service_client is None:
-        pause_service_client = node.create_client(DrlPause, f'/{ROBOT_ID}/{ROBOT_MODEL}/dsr01/drl/drl_pause')
+        pause_service_client = node.create_client(DrlPause, f'/{ROBOT_ID}/{ROBOT_MODEL}/dsr01/m1013/dsr01/drl/drl_pause')
 
-    # Wait briefly for service to be available
     if not pause_service_client.wait_for_service(timeout_sec=1.0):
-        logger.warn("Pause service not available, skipping service call.")
+        logger.warn("Pause service not available.")
         return
 
     req = DrlPause.Request()
@@ -45,6 +49,49 @@ def send_pause_service_request(node):
         logger.info(f"Pause service responded: success={future.result().success}")
     else:
         logger.error("Pause service call failed or timed out.")
+
+
+def save_current_pose(node):
+    global pose_service_client
+
+    if pose_service_client is None:
+        pose_service_client = node.create_client(GetCurrentPosx, f'/{ROBOT_ID}/{ROBOT_MODEL}/dsr01/aux_control/get_current_posx')
+
+    if not pose_service_client.wait_for_service(timeout_sec=2.0):
+        logger.warn("Pose service not available.")
+        return
+
+    req = GetCurrentPosx.Request()
+    future = pose_service_client.call_async(req)
+    rclpy.spin_until_future_complete(node, future, timeout_sec=3.0)
+
+    if future.result():
+        pos = future.result().pos
+        pose_dict = {
+            "x": pos.x,
+            "y": pos.y,
+            "z": pos.z,
+            "rx": pos.rx,
+            "ry": pos.ry,
+            "rz": pos.rz,
+            "timestamp": time.time()
+        }
+
+        # Append to YAML file
+        if os.path.exists(POSE_SAVE_PATH):
+            with open(POSE_SAVE_PATH, 'r') as f:
+                data = yaml.safe_load(f) or []
+        else:
+            data = []
+
+        data.append(pose_dict)
+        with open(POSE_SAVE_PATH, 'w') as f:
+            yaml.dump(data, f)
+
+        logger.info(f"Pose saved to {POSE_SAVE_PATH}")
+    else:
+        logger.error("Failed to get pose from service.")
+
 
 def robot_motion():
     from DSR_ROBOT2 import print_ext_result, movej, movel, set_velx, set_accx, set_robot_mode
@@ -74,7 +121,7 @@ def robot_motion():
     while rclpy.ok() and count < max_count and not stop_flag.is_set():
         logger.info(f"[Cycle {count+1}] Waiting for resume signal...")
 
-        pause_flag.wait()  # Block here if paused
+        pause_flag.wait()  # Pause point
 
         movej(p1, vel=100, acc=100)
         for pos in positions:
@@ -87,31 +134,33 @@ def robot_motion():
 
     print("Motion finished")
 
+
 def user_control(node):
     while rclpy.ok() and not stop_flag.is_set():
-        cmd = input("[1=Pause, 2=Resume, 0=Exit] > ").strip().lower()
+        cmd = input("[1=Pause & Save Pose, 2=Resume, 0=Exit] > ").strip().lower()
 
         if cmd == "1":
             pause_flag.clear()
             logger.info("Motion Paused.")
-            send_pause_service_request(node)  # Call pause service here
+            send_pause_service_request(node)
+            save_current_pose(node)  # Save pose on pause
         elif cmd == "2":
             pause_flag.set()
             logger.info("Motion Resumed.")
         elif cmd == "0":
             stop_flag.set()
-            pause_flag.set()  # In case it's paused
+            pause_flag.set()
             logger.info("Exiting program...")
             break
         else:
             logger.info("Invalid command. Use '1', '2', or '0'.")
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = rclpy.create_node('dsr_threaded_control', namespace=ROBOT_ID)
     DR_init.__dsr__node = node
 
-    # Start motion and control threads
     motion_thread = threading.Thread(target=robot_motion)
     control_thread = threading.Thread(target=user_control, args=(node,))
 
@@ -125,5 +174,7 @@ def main(args=None):
     rclpy.shutdown()
     print("Shutdown complete.")
 
+
 if __name__ == "__main__":
     main()
+
